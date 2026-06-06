@@ -168,6 +168,12 @@ module.exports = function autoFishing(mod) {
     // Credit banner (console, once per connection).
     mod.log(`v${mod.info.version} by czentovic-tr (orig. SoliaRdi) | https://github.com/czentovic-tr`);
 
+    // [Asura fix] C_RQ_ADD_ITEM_TO_DECOMPOSITION_CONTRACT is NOT in the toolbox padding
+    // table, so the proxy doesn't add the required 8-byte counter+unk prefix and the server
+    // rejects the add -> "menu opens but items aren't placed". Mark the opcode as padded and
+    // recompile its def so the proxy fills the prefix (same path that makes C_USE_ITEM work).
+    enableContractPadding();
+
     // ---------------------------------------------------------------------------------
     //  Lifecycle
     // ---------------------------------------------------------------------------------
@@ -295,7 +301,7 @@ module.exports = function autoFishing(mod) {
             hook('S_DIALOG', 2, sDialog);
             if (!Object.values(extendedFunctions.seller).some(x => !x))
                 hook('S_STORE_BASKET', 'raw', sStoreBasket);
-            hook('S_RP_ADD_ITEM_TO_DECOMPOSITION_CONTRACT', 1, sRpAddItem);
+            // (dismantle add-loop is self-driving now; no need to hook S_RP_ADD_ITEM)
             hook('S_SPAWN_NPC', 11, sSpawnNpc);
             hook('S_ABNORMALITY_BEGIN', mod.majorPatchVersion >= 86 ? 4 : 3, sAbnBegin);
             // [>=88] cast/minigame counters are captured by permanent RAW hooks, not here.
@@ -966,14 +972,19 @@ module.exports = function autoFishing(mod) {
         }
     }
 
+    // Self-driving: add each marked fish into the contract with a humanized gap, then commit.
+    // (Does not wait for S_RP_ADD_ITEM, so it doesn't depend on parsing the server reply.)
     function dismantleFish() {
-        let fish = request.fishes.shift();
-        if (fish != undefined) {
-            flog('C->S C_RQ_ADD_ITEM (bot)', { contract: request.contractId, dbid: String(fish.dbid), itemid: fish.id, slot: fish.slot, pocket: fish.pocket });
-            mod.send('C_RQ_ADD_ITEM_TO_DECOMPOSITION_CONTRACT', 1, {
-                contract: request.contractId, dbid: fish.dbid, itemid: fish.id, amount: 1,
-            });
+        const fish = request.fishes.shift();
+        if (fish === undefined) {
+            mod.setTimeout(commitDecomposition, rng(config.time.dismantle));
+            return;
         }
+        flog('C->S C_RQ_ADD_ITEM (bot)', { contract: request.contractId, itemid: fish.id, dbid: String(fish.dbid) });
+        mod.send('C_RQ_ADD_ITEM_TO_DECOMPOSITION_CONTRACT', 1, {
+            contract: request.contractId, dbid: fish.dbid, itemid: fish.id, amount: 1,
+        });
+        mod.setTimeout(dismantleFish, rng(config.time.dismantle));
     }
 
     function commitDecomposition() {
@@ -1141,6 +1152,25 @@ module.exports = function autoFishing(mod) {
                     present.add(id);
                 }
             }
+        }
+    }
+
+    // Mark C_RQ_ADD_ITEM_TO_DECOMPOSITION_CONTRACT as a "padded" packet and recompile its
+    // definition, so the proxy auto-prepends the counter+unk prefix the Asura server requires.
+    function enableContractPadding() {
+        try {
+            const map = mod.dispatch.protocolMap;
+            const proto = mod.dispatch.protocol;
+            const name = 'C_RQ_ADD_ITEM_TO_DECOMPOSITION_CONTRACT';
+            const code = map.name.get(name);
+            if (code === undefined || code === null) { mod.warn('dismantle: opcode for ' + name + ' not mapped.'); return; }
+            if (map.padding[code]) return; // already padded
+            map.padding[code] = true;
+            const parsed = proto.parseDefinition(path.join(__dirname, 'defs', name + '.1.def'));
+            mod.dispatch.addDefinition(name, 1, parsed, true); // overwrite -> recompiles WITH padding now set
+            mod.log('dismantle: enabled padding for ' + name + ' (opcode ' + code + ').');
+        } catch (e) {
+            mod.warn('dismantle: failed to enable contract padding: ' + e.message);
         }
     }
 

@@ -2,7 +2,7 @@
 
 Automated fishing mod for **TERA** on the **Asura** private server, running under TERA Toolbox.
 
-- **Developer / Maintainer:** [czentovic-tr](https://github.com/czentovic-tr)
+- **Developer / Maintainer:** [czentovic-tr](https://github.com/czentovic-tr) / [Emre-Ged](https://github.com/Emre-Ged)
 - **Original mod by:** SoliaRdi
 
 It auto-completes the fishing minigame, uses bait/rods, crafts bait from filets, and dismantles unwanted fish — all with humanized, tier-scaled timing to behave like a real player.

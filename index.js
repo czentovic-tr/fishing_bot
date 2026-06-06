@@ -68,6 +68,14 @@ module.exports = function autoFishing(mod) {
         70276: 206053, // Pilidium Bait
         70371: 209189, // Event Shark Bait (Murcai Fishery only)
     };
+    const BAIT_CRAFT_AMOUNT = 10;
+    const BAIT_STACK_LIMIT = 60;
+    const BAIT_RECIPES = {
+        bait2: { id: 204100, item: 206001, label: 'Bait II' },
+        bait3: { id: 204101, item: 206002, label: 'Bait III' },
+        bait4: { id: 204102, item: 206003, label: 'Bait IV' },
+        bait5: { id: 204103, item: 206004, label: 'Bait V' },
+    };
     const ITEMS_BANKER = [60264, 160326, 170003, 210111, 216754];
     const ITEMS_SELLER = [160324, 170004, 210109, 60262, 60263, 160325, 170006, 210110];
     const TEMPLATE_SELLER = [9903, 9906, 1960, 1961];
@@ -138,6 +146,7 @@ module.exports = function autoFishing(mod) {
     let startSafetyTimer = null;
     let sniffFishing = false, sniffTimer = null; // diagnostic packet sniffer
     let dismantleIds = new Set();                 // fish IDs flagged dismantle=1 in the settings table
+    let warnedMissingCraftRecipe = false;          // avoid spamming when auto-craft is enabled but no recipe is saved
 
     let extendedFunctions = {
         'banker': { 'C_PUT_WARE_ITEM': false },
@@ -567,7 +576,12 @@ module.exports = function autoFishing(mod) {
     function sEndProduce(event) {
         if (request.action == 'craft' && event.success) {
             stats.baitsCrafted += 10; // one craft == 10 baits
-            mod.setTimeout(makeDecision, rng(config.time.contract));
+            mod.setTimeout(() => {
+                if (shouldContinueCraftingBait())
+                    startCraft();
+                else
+                    makeDecision();
+            }, rng(config.time.contract));
         }
     }
 
@@ -794,6 +808,9 @@ module.exports = function autoFishing(mod) {
         let filets = mod.game.inventory.findInBagOrPockets(FILET_ID);
         let bait = mod.game.inventory.findInBagOrPockets(Object.values(BAITS));
         let salad = mod.game.inventory.findInBagOrPockets(ITEMS_SALAD);
+        const selectedRecipe = getSelectedRecipe();
+        const selectedBait = selectedRecipe ? mod.game.inventory.findInBagOrPockets(selectedRecipe.item) : null;
+        const selectedBaitAmount = itemAmount(selectedBait);
 
         // [new] Marked fish are dismantled instantly on catch (see postCatch), so only KEPT
         // fish accumulate. When the bag is nearly full of keepers -> stop & notify (user choice).
@@ -803,13 +820,22 @@ module.exports = function autoFishing(mod) {
             return;
         }
 
+        const activeBait = Object.keys(BAITS).some(el => abnormalityDuration(Number(el)) > 0);
+        const craftWouldFit = !selectedRecipe || selectedBaitAmount <= BAIT_STACK_LIMIT - BAIT_CRAFT_AMOUNT;
+        const canCraftBait = config.autocraftbait && filets !== undefined && filets.amount >= config.craftBaitMinFilets && craftWouldFit;
+        const shouldCraftBait = canCraftBait && (config.recipe === undefined || selectedBaitAmount <= config.craftBaitThreshold);
+
         if (config.autosalad && abnormalityDuration(70261) <= 0 && salad !== undefined) {
             action = 'usesalad';
         } else if (filets !== undefined && filets.amount >= 9000 && config.filetmode === 'bank') {
             action = 'toomanyfilets';
+        } else if (shouldCraftBait && (bait === undefined || activeBait)) {
+            // Auto-craft before the next cast when bait is gone, or top up while a bait buff is still active.
+            // If bait exists but no buff is active, using bait first is more useful than crafting immediately.
+            action = 'craft';
         } else if (bait !== undefined) {
-            action = (Object.keys(BAITS).every(el => abnormalityDuration(Number(el)) <= 0)) ? 'usebait' : 'userod';
-        } else if (filets !== undefined && filets.amount >= 60) {
+            action = (!activeBait) ? 'usebait' : 'userod';
+        } else if (canCraftBait && bait === undefined) {
             action = 'craft'; // out of bait -> craft more from filets
         } else {
             action = 'userod'; // out of bait, not enough filets yet -> keep fishing (dismantles build filets up)
@@ -859,8 +885,16 @@ module.exports = function autoFishing(mod) {
                 break;
             case 'craft': {
                 if (config.recipe === undefined) {
-                    notify('ERROR: no crafting recipe set (use /8 fish setrecipe).');
-                    action = 'aborted';
+                    if (!warnedMissingCraftRecipe) {
+                        notify('No bait recipe selected. Select one with /8 fish setrecipe bait3 (or bait2/bait4/bait5). Continuing without crafting for now.');
+                        warnedMissingCraftRecipe = true;
+                    }
+                    action = 'userod';
+                    request = { rod: mod.game.inventory.findInBagOrPockets(flatSingle(ITEMS_RODS)) };
+                    if (request.rod === undefined) {
+                        notify('ERROR: no fishing rod found.');
+                        action = 'aborted';
+                    }
                 } else {
                     request = { recipe: config.recipe };
                 }
@@ -1002,7 +1036,24 @@ module.exports = function autoFishing(mod) {
     }
 
     function startCraft() {
+        if (request.recipe === undefined || request.recipe === null) {
+            mod.setTimeout(makeDecision, rng(config.time.decision));
+            return;
+        }
         mod.send('C_START_PRODUCE', 1, { recipe: request.recipe });
+    }
+
+    function shouldContinueCraftingBait() {
+        const selectedRecipe = getSelectedRecipe();
+        if (!selectedRecipe || !config.autocraftbait)
+            return false;
+
+        const filets = mod.game.inventory.findInBagOrPockets(FILET_ID);
+        if (filets === undefined || filets.amount < config.craftBaitMinFilets)
+            return false;
+
+        const selectedBait = mod.game.inventory.findInBagOrPockets(selectedRecipe.item);
+        return itemAmount(selectedBait) <= BAIT_STACK_LIMIT - BAIT_CRAFT_AMOUNT;
     }
 
     // ---------------------------------------------------------------------------------
@@ -1253,6 +1304,10 @@ module.exports = function autoFishing(mod) {
         if (c.gmmode === undefined) c.gmmode = 'stop';
         if (c.filetmode === undefined) c.filetmode = false;
         if (c.autosalad === undefined) c.autosalad = false;
+        if (c.autocraftbait === undefined) c.autocraftbait = true;
+        if (!(c.craftBaitThreshold >= 0)) c.craftBaitThreshold = 0; // craft when bait stack is at/below this amount
+        c.craftBaitThreshold = Math.min(c.craftBaitThreshold, BAIT_STACK_LIMIT - BAIT_CRAFT_AMOUNT);
+        if (!(c.craftBaitMinFilets >= 60)) c.craftBaitMinFilets = 60; // recipe consumes 60 filets on current servers
         if (c.skipbaf === undefined) c.skipbaf = false;
         // new options
         if (c.humanize === undefined) c.humanize = true;
@@ -1287,6 +1342,8 @@ module.exports = function autoFishing(mod) {
         mod.command.message(`reel (LOCKED): ${REEL_BASE.min / 1000}-${REEL_BASE.max / 1000}s + tier x ${REEL_PER_LEVEL.min / 1000}-${REEL_PER_LEVEL.max / 1000}s, cap ${REEL_CAP / 1000}s | speed: ${config.speed} (biases within range)`);
         mod.command.message(`timings(ms): react ${T.stMinigame.min}-${T.stMinigame.max}, recast ${T.rod.min}-${T.rod.max}, decision ${T.decision.min}-${T.decision.max}`);
         mod.command.message(`filetmode: ${config.filetmode || 'off'} | skipbaf: ${config.skipbaf ? 'on' : 'off'} | autosalad: ${config.autosalad ? 'on' : 'off'}`);
+        mod.command.message(`autocraft bait: ${config.autocraftbait ? 'on' : 'off'} | recipe: ${formatRecipe()} | threshold: <=${config.craftBaitThreshold} bait | min filets: ${config.craftBaitMinFilets}`);
+        mod.command.message(`craft fill: target ${BAIT_STACK_LIMIT}, next craft allowed at <=${BAIT_STACK_LIMIT - BAIT_CRAFT_AMOUNT}`);
         mod.command.message('Tune fast: /8 fish speed slow|normal|fast  -  or edit config.json then /8 fish reloadconf');
     }
 
@@ -1315,6 +1372,26 @@ module.exports = function autoFishing(mod) {
             return Math.round(v);
         }
         return min + Math.floor(Math.random() * (max - min + 1));
+    }
+
+    function itemAmount(item) {
+        if (item === undefined || item === null) return 0;
+        return (typeof item.amount === 'number' && item.amount > 0) ? item.amount : 1;
+    }
+
+    function formatRecipe() {
+        if (config.recipe === undefined)
+            return 'not set';
+
+        const recipe = getSelectedRecipe();
+        return recipe ? `${recipe.label} (${config.recipe})` : config.recipe;
+    }
+
+    function getSelectedRecipe() {
+        if (config.recipe === undefined)
+            return null;
+
+        return Object.values(BAIT_RECIPES).find(entry => entry.id === config.recipe) || null;
     }
 
     function fmtDur(ms) {
@@ -1380,9 +1457,50 @@ module.exports = function autoFishing(mod) {
                 }
                 break;
             case 'setrecipe':
-                if (lastRecipe != null) { config.recipe = lastRecipe; mod.command.message(`Recipe id set to: ${lastRecipe}`); }
-                else mod.command.message('Manually craft bait once (with the mod enabled) first.');
+                const recipeArg = arg ? arg.toLowerCase().replace(/:$/, '') : arg;
+                if (recipeArg === 'clear') {
+                    delete config.recipe;
+                    warnedMissingCraftRecipe = false;
+                    mod.command.message('Crafting recipe cleared.');
+                } else if (recipeArg && BAIT_RECIPES[recipeArg]) {
+                    const recipe = BAIT_RECIPES[recipeArg];
+                    config.recipe = recipe.id;
+                    warnedMissingCraftRecipe = false;
+                    mod.command.message(`Crafting recipe set to ${recipe.label} (${recipe.id}).`);
+                } else if (lastRecipe != null) {
+                    config.recipe = lastRecipe;
+                    warnedMissingCraftRecipe = false;
+                    mod.command.message(`Recipe id set to: ${lastRecipe}`);
+                } else {
+                    mod.command.message('No recipe selected. Use /8 fish setrecipe bait3, or manually craft bait once then /8 fish setrecipe.');
+                    mod.command.message('Available presets: bait2, bait3, bait4, bait5.');
+                }
                 break;
+            case 'autocraft': {
+                if (arg === 'on' || arg === 'off') {
+                    config.autocraftbait = (arg === 'on');
+                    mod.command.message('Auto-craft bait ' + (config.autocraftbait ? 'enabled' : 'disabled') + '.');
+                } else if (arg === 'threshold') {
+                    const n = parseInt(arg2);
+                    if (n >= 0) {
+                        config.craftBaitThreshold = Math.min(n, BAIT_STACK_LIMIT - BAIT_CRAFT_AMOUNT);
+                        mod.command.message(`Auto-craft bait threshold set to <=${config.craftBaitThreshold} bait.`);
+                        if (n > config.craftBaitThreshold)
+                            mod.command.message(`Threshold capped at ${config.craftBaitThreshold}, because each craft adds ${BAIT_CRAFT_AMOUNT} and bait stacks to ${BAIT_STACK_LIMIT}.`);
+                    } else mod.command.message('Usage: /8 fish autocraft threshold <amount>');
+                } else if (arg === 'minfilets') {
+                    const n = parseInt(arg2);
+                    if (n >= 60) {
+                        config.craftBaitMinFilets = n;
+                        mod.command.message(`Auto-craft bait minimum filets set to ${config.craftBaitMinFilets}.`);
+                    } else mod.command.message('Usage: /8 fish autocraft minfilets <amount>=60 or higher');
+                } else {
+                    mod.command.message(`Auto-craft bait is ${config.autocraftbait ? 'ON' : 'off'} | recipe: ${formatRecipe()} | threshold <=${config.craftBaitThreshold} | min filets ${config.craftBaitMinFilets}`);
+                    mod.command.message(`Craft fill target: ${BAIT_STACK_LIMIT}; next craft allowed at <=${BAIT_STACK_LIMIT - BAIT_CRAFT_AMOUNT}.`);
+                    mod.command.message('Usage: /8 fish autocraft on|off | autocraft threshold <amount> | autocraft minfilets <amount>');
+                }
+                break;
+            }
             case 'sellscroll':
                 config.filetmode = 'sellscroll';
                 mod.command.message('Set to sell fishes (scroll) after filling inventory.');
@@ -1523,7 +1641,8 @@ module.exports = function autoFishing(mod) {
                 mod.command.message('Commands: fish | settings | speed slow|normal|fast | info | stats | debug');
                 mod.command.message('  skipbaf | autosalad | humanize | notify | logfile');
                 mod.command.message('  dismantle on|off | now | tier <0-10> on|off | baf on|off | allon|alloff | status | <ctrl+click fish>');
-                mod.command.message('  filetmode bank <n> | setrecipe (craft bait from filets)');
+                mod.command.message('  filetmode bank <n> | setrecipe bait2|bait3|bait4|bait5 | setrecipe clear');
+                mod.command.message('  autocraft on|off | autocraft threshold <n> | autocraft minfilets <n>');
                 mod.command.message('  breaks on|off | breaks set <fishMin> <fishMax> <idleMin> | autostop <min> | autostop daily <HH:MM>');
                 mod.command.message('  gmmode exit|lobby|stop|nothing | save | reloadconf');
                 mod.command.message('  Troubleshooting: /8 fish debug logs packets to mods/auto-fishing/auto-fishing-debug.log');

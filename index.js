@@ -70,11 +70,13 @@ module.exports = function autoFishing(mod) {
     };
     const BAIT_CRAFT_AMOUNT = 10;
     const BAIT_STACK_LIMIT = 60;
+    // Each craft yields 10 bait (BAIT_CRAFT_AMOUNT); bait stacks to 60 (BAIT_STACK_LIMIT).
+    // cost = filets consumed per craft (Asura): Bait II 15, III 20, IV 25, V 30.
     const BAIT_RECIPES = {
-        bait2: { id: 204100, item: 206001, label: 'Bait II' },
-        bait3: { id: 204101, item: 206002, label: 'Bait III' },
-        bait4: { id: 204102, item: 206003, label: 'Bait IV' },
-        bait5: { id: 204103, item: 206004, label: 'Bait V' },
+        bait2: { id: 204100, item: 206001, label: 'Bait II', cost: 15 },
+        bait3: { id: 204101, item: 206002, label: 'Bait III', cost: 20 },
+        bait4: { id: 204102, item: 206003, label: 'Bait IV', cost: 25 },
+        bait5: { id: 204103, item: 206004, label: 'Bait V', cost: 30 },
     };
     const ITEMS_BANKER = [60264, 160326, 170003, 210111, 216754];
     const ITEMS_SELLER = [160324, 170004, 210109, 60262, 60263, 160325, 170006, 210110];
@@ -135,6 +137,7 @@ module.exports = function autoFishing(mod) {
         idleCheckTimer = null;
     let DEBUG = false;
     let hooks = [];
+    let nextActionTimer = null; // [#3] single pending "next decision" so overlapping triggers can't double-cast
     let fishingMapped = true;
     let fishingCounter = 1; // [>=88] mirrors the client's real cast sequence counter
     let minigameCounter = null; // [>=88] last confirmed-good C_START sequence counter (null = unknown)
@@ -144,9 +147,13 @@ module.exports = function autoFishing(mod) {
     let awaitingStart = false;  // [>=88] a bot C_START is in flight, awaiting catch/cancel
     let lastSentStart = null;   // [>=88] counter value of the in-flight bot C_START
     let startSafetyTimer = null;
-    let sniffFishing = false, sniffTimer = null; // diagnostic packet sniffer
+    let sniffFishing = false, sniffTimer = null, sniffHook = null; // diagnostic packet sniffer (hook registered only while armed)
     let dismantleIds = new Set();                 // fish IDs flagged dismantle=1 in the settings table
     let warnedMissingCraftRecipe = false;          // avoid spamming when auto-craft is enabled but no recipe is saved
+    let craftFiletsBefore = null;                  // [craft] filets before the in-flight craft (for cost learning)
+    let craftingRecipeId = null;                   // [craft] recipe id of the in-flight craft
+    let craftFailures = 0;                          // [craft] consecutive failed crafts
+    let craftSafetyTimer = null;                    // [craft] recover if S_END_PRODUCE never arrives
 
     let extendedFunctions = {
         'banker': { 'C_PUT_WARE_ITEM': false },
@@ -158,8 +165,11 @@ module.exports = function autoFishing(mod) {
     let statistic = [], startTime = null, endTime = null, lastLevel = null;
     let stats = freshStats();
 
-    // [C] Break / [E] auto-stop scheduling
-    let breakTimer = null, onBreak = false, autostopTimer = null, clockTimer = null;
+    // [C] Break / [E] auto-stop scheduling.
+    // Deadline-based + a single interval, so mod.clearAllTimeouts() (fired on zone load,
+    // break start, etc.) can NEVER wipe break/auto-stop. The interval is the only timer.
+    let onBreak = false;
+    let breakNextAt = 0, breakEndAt = 0, autostopAt = 0, schedulerTimer = null;
 
     // [B] Config now lives in the toolbox settings system (per-character profile).
     let config = null, activeKey = null;
@@ -227,6 +237,8 @@ module.exports = function autoFishing(mod) {
 
     mod.game.on('leave_game', () => {
         enabled = false;
+        stopScheduler();
+        stopSniff();
         clearBreakTimers();
         clearAutostop();
         mod.clearAllTimeouts();
@@ -234,6 +246,8 @@ module.exports = function autoFishing(mod) {
     });
 
     this.destructor = () => {
+        stopScheduler();
+        stopSniff();
         clearBreakTimers();
         clearAutostop();
         mod.clearAllTimeouts();
@@ -319,6 +333,7 @@ module.exports = function autoFishing(mod) {
             stats = freshStats();
             stats.sessionStart = Date.now();
             statistic = []; startTime = null; endTime = null; lastLevel = null;
+            startScheduler();
             scheduleBreak();
             scheduleAutostop();
             // dismantle any already-marked fish sitting in the bag right now
@@ -330,6 +345,7 @@ module.exports = function autoFishing(mod) {
                 if (h) mod.unhook(h);
             }
             hooks = [];
+            stopScheduler();
             clearBreakTimers();
             clearAutostop();
             mod.command.message('Auto fishing deactivated.');
@@ -348,11 +364,11 @@ module.exports = function autoFishing(mod) {
             switch (request.action) {
                 case 'usesalad':
                     if (event.id == 70261)
-                        mod.setTimeout(makeDecision, rng(config.time.bait));
+                        scheduleNext(makeDecision, rng(config.time.bait));
                     break;
                 case 'usebait':
                     if (Object.keys(BAITS).includes(event.id.toString()))
-                        mod.setTimeout(makeDecision, rng(config.time.bait));
+                        scheduleNext(makeDecision, rng(config.time.bait));
                     break;
             }
         }
@@ -404,11 +420,14 @@ module.exports = function autoFishing(mod) {
                 lastSentStart = counter;
                 mod.send('C_START_FISHING_MINIGAME', 2, { counter, unk });
                 flog('C->S C_START_FISHING_MINIGAME (bot)', { counter, unk, calibrated: minigameCounter != null });
-                // safety: if neither catch nor cancel arrives, recover and retry
+                // safety: recover only if S_START_FISHING_MINIGAME never arrives (it normally
+                // comes in <1s). Once it arrives, sStartFishingMinigame EXTENDS this timer to
+                // cover the real reel time (a BAF legitimately takes up to ~28s), so we never
+                // "recover" mid-catch and desync.
                 mod.clearTimeout(startSafetyTimer);
                 startSafetyTimer = mod.setTimeout(() => {
-                    if (awaitingStart) { awaitingStart = false; flog('start timed out, retrying'); makeDecision(); }
-                }, 12000);
+                    if (awaitingStart) { awaitingStart = false; flog('start timed out (no S_START), retrying'); makeDecision(); }
+                }, 10000);
             }, rng(config.time.stMinigame));
             return;
         }
@@ -444,6 +463,12 @@ module.exports = function autoFishing(mod) {
             let delay = base + lvl * per;
             if (Math.random() < 0.08) delay += 500 + Math.random() * 2500; // occasional human hesitation (only adds)
             delay = Math.round(Math.min(delay, REEL_CAP));
+            // [fix] extend the safety timeout to cover THIS fish's reel time (a BAF takes ~15-20s,
+            // up to the 28s cap). The 12s timer used to fire mid-reel on big fish and desync the bot.
+            mod.clearTimeout(startSafetyTimer);
+            startSafetyTimer = mod.setTimeout(() => {
+                if (awaitingStart) { awaitingStart = false; flog('catch timed out, retrying'); makeDecision(); }
+            }, delay + 10000);
             mod.setTimeout(() => {
                 mod.send('C_END_FISHING_MINIGAME', 2, { counter: cnt, unk: 24, success: true });
                 flog('C->S C_END_FISHING_MINIGAME (bot)', { counter: cnt, level: lvl, delayMs: Math.round(delay) });
@@ -468,8 +493,11 @@ module.exports = function autoFishing(mod) {
 
     function sFishingCatchFail(event) {
         flog('S->C S_FISHING_CATCH_FAIL', { gameId: String(event.gameId), isMe: mod.game.me.is(event.gameId) });
-        if (mod.game.me.is(event.gameId))
-            mod.setTimeout(makeDecision, rng(config.time.rod));
+        if (mod.game.me.is(event.gameId)) {
+            awaitingStart = false;                 // [#5] clear in-flight state on a failed catch
+            mod.clearTimeout(startSafetyTimer);
+            scheduleNext(makeDecision, rng(config.time.rod));
+        }
     }
 
     function sFishingCatch(event) {
@@ -490,10 +518,10 @@ module.exports = function autoFishing(mod) {
             stats.fish++;
             if (lastLevel != null) {
                 stats.byLevel[lastLevel] = (stats.byLevel[lastLevel] || 0) + 1;
-                stats.goldEst += (PRICES[Math.min(Math.max(lastLevel - 1, 0), PRICES.length - 1)] || 0);
+                stats.goldEst += (PRICES[Math.min(Math.max(lastLevel, 0), PRICES.length - 1)] || 0); // [#6] tier indexes PRICES directly
             }
             startTime = Date.now();
-            mod.setTimeout(postCatch, rng(config.time.decision));
+            scheduleNext(postCatch, rng(config.time.decision));
         }
     }
 
@@ -516,13 +544,13 @@ module.exports = function autoFishing(mod) {
                 notify('Auto-calibration could not find the fishing counter. Press your fishing key ONCE to seed it (this also captures the unk token), then I will continue.');
             } else {
                 flog('start rejected, retrying', { nextCounter: calGuess, try: calTries });
-                mod.setTimeout(makeDecision, rng(config.time.rod));
+                scheduleNext(makeDecision, rng(config.time.rod));
             }
             return;
         }
 
         if (message.id == 'SMT_CANNOT_FISHING_NON_AREA')
-            mod.setTimeout(makeDecision, rng(config.time.rod));
+            scheduleNext(makeDecision, rng(config.time.rod));
     }
 
     function sRequestContract(event) {
@@ -560,11 +588,11 @@ module.exports = function autoFishing(mod) {
             case 'sellscroll':
             case 'selltonpc':
                 if (event.type == 9 && request.seller.contractId == event.id)
-                    mod.setTimeout(makeDecision, rng(config.time.contract));
+                    scheduleNext(makeDecision, rng(config.time.contract));
                 break;
             case 'bank':
                 if (event.type == 26 && request.banker.contractId == event.id)
-                    mod.setTimeout(makeDecision, rng(config.time.contract));
+                    scheduleNext(makeDecision, rng(config.time.contract));
                 break;
             case 'dismantle':
                 if (event.type == dismantle_contract_type && request.contractId == event.id)
@@ -574,14 +602,27 @@ module.exports = function autoFishing(mod) {
     }
 
     function sEndProduce(event) {
-        if (request.action == 'craft' && event.success) {
-            stats.baitsCrafted += 10; // one craft == 10 baits
-            mod.setTimeout(() => {
-                if (shouldContinueCraftingBait())
-                    startCraft();
-                else
-                    makeDecision();
+        if (request.action !== 'craft') return;
+        mod.clearTimeout(craftSafetyTimer);
+        if (event.success) {
+            craftFailures = 0;
+            stats.baitsCrafted += BAIT_CRAFT_AMOUNT;
+            scheduleNext(() => {
+                learnRecipeCost();                          // [Phase 2] only learns for unknown recipes
+                if (shouldContinueCraftingBait()) startCraft();
+                else makeDecision();
             }, rng(config.time.contract));
+        } else {
+            // [Phase 1] a failed craft used to STALL the bot (no makeDecision). Recover.
+            craftFailures++;
+            craftFiletsBefore = null;
+            if (craftFailures >= 3) {
+                config.autocraftbait = false;
+                notify('Auto-craft disabled after 3 failed crafts - have you learned this bait recipe? Re-enable: /8 fish autocraft on.');
+            } else {
+                notify('Craft failed - will retry. (Make sure you have learned this bait recipe.)');
+            }
+            scheduleNext(makeDecision, rng(config.time.contract));
         }
     }
 
@@ -658,21 +699,30 @@ module.exports = function autoFishing(mod) {
         flog('C->S C_END_FISHING_MINIGAME (client,raw)', { counter: c, success: s });
     });
 
-    // Diagnostic sniffer: when armed via "/8 fish sniff", logs every outgoing client
-    // packet (minus movement/ping noise) so we can identify the reel / F-press packet
-    // used by the fishing minigame. Cheap when disarmed (early return).
+    // Diagnostic sniffer: logs every outgoing client packet (minus movement/ping noise) so
+    // we can identify reel/contract packets. The '*' raw hook forces a Buffer copy of EVERY
+    // packet, so we register it ONLY while armed (/8 fish sniff) and unhook when the window ends.
     const SNIFF_SKIP = new Set([
         'C_PLAYER_LOCATION', 'C_PLAYER_FLYING_LOCATION', 'C_NOTIFY_LOCATION_IN_ACTION',
         'C_REQUEST_GAMESTAT_PING', 'C_CHAT', 'C_WHISPER', 'C_GUILD_CHAT'
     ]);
-    permHook('*', 'raw', (code, data, incoming, fake) => {
+    function sniffPacket(code, data, incoming, fake) {
         if (!sniffFishing || fake || incoming) return;
         let name = mod.dispatch.protocolMap.code.get(code) || ('#' + code);
         if (SNIFF_SKIP.has(name)) return;
         let hex = '';
         try { hex = data.slice(4, Math.min(data.length, 28)).toString('hex'); } catch (_) {}
         flog('SNIFF C->S ' + name, { len: data.length, payload: hex });
-    });
+    }
+    function startSniff() {
+        sniffFishing = true;
+        if (!sniffHook) sniffHook = mod.tryHook('*', 'raw', sniffPacket);
+    }
+    function stopSniff() {
+        sniffFishing = false;
+        if (sniffTimer) { mod.clearTimeout(sniffTimer); sniffTimer = null; }
+        if (sniffHook) { mod.unhook(sniffHook); sniffHook = null; }
+    }
 
     permHook('S_SPAWN_NPC', 11, event => {
         if (TEMPLATE_SELLER.includes(event.templateId) ||
@@ -798,6 +848,13 @@ module.exports = function autoFishing(mod) {
         sweepDismantle(makeDecision); // clear marked fish (caught + any leftovers), then decide next
     }
 
+    // [#3] Schedule the next decision-loop step, cancelling any previously-queued one so two
+    // overlapping triggers (e.g. a catch + a stray system message) can't start parallel chains.
+    function scheduleNext(fn, delay) {
+        mod.clearTimeout(nextActionTimer);
+        nextActionTimer = mod.setTimeout(fn, delay);
+    }
+
     function makeDecision() {
         if (onBreak) return; // [C] suspended during a scheduled break
         mod.clearTimeout(idleCheckTimer);
@@ -808,9 +865,11 @@ module.exports = function autoFishing(mod) {
         let filets = mod.game.inventory.findInBagOrPockets(FILET_ID);
         let bait = mod.game.inventory.findInBagOrPockets(Object.values(BAITS));
         let salad = mod.game.inventory.findInBagOrPockets(ITEMS_SALAD);
+        const filetAmt = itemAmount(filets);
         const selectedRecipe = getSelectedRecipe();
         const selectedBait = selectedRecipe ? mod.game.inventory.findInBagOrPockets(selectedRecipe.item) : null;
         const selectedBaitAmount = itemAmount(selectedBait);
+        const craftCost = selectedRecipe ? recipeCost(selectedRecipe.id) : (config.craftBaitMinFilets || 60);
 
         // [new] Marked fish are dismantled instantly on catch (see postCatch), so only KEPT
         // fish accumulate. When the bag is nearly full of keepers -> stop & notify (user choice).
@@ -821,9 +880,15 @@ module.exports = function autoFishing(mod) {
         }
 
         const activeBait = Object.keys(BAITS).some(el => abnormalityDuration(Number(el)) > 0);
-        const craftWouldFit = !selectedRecipe || selectedBaitAmount <= BAIT_STACK_LIMIT - BAIT_CRAFT_AMOUNT;
-        const canCraftBait = config.autocraftbait && filets !== undefined && filets.amount >= config.craftBaitMinFilets && craftWouldFit;
-        const shouldCraftBait = canCraftBait && (config.recipe === undefined || selectedBaitAmount <= config.craftBaitThreshold);
+        const craftWouldFit = selectedRecipe && (selectedBaitAmount + BAIT_CRAFT_AMOUNT <= craftTarget()); // [Phase 3] up to target
+        const canCraftBait = config.autocraftbait && selectedRecipe && filetAmt >= craftCost && craftWouldFit; // [Phase 2] per-recipe cost
+        const shouldCraftBait = canCraftBait && selectedBaitAmount <= config.craftBaitThreshold;
+
+        // one-time hint if auto-craft is on but there's no usable recipe
+        if (config.autocraftbait && !selectedRecipe && filetAmt >= 15 && !warnedMissingCraftRecipe) {
+            notify('Auto-craft is on but no bait recipe is selected. Use /8 fish setrecipe bait2|bait3|bait4|bait5 (pick one you have learned).');
+            warnedMissingCraftRecipe = true;
+        }
 
         if (config.autosalad && abnormalityDuration(70261) <= 0 && salad !== undefined) {
             action = 'usesalad';
@@ -847,7 +912,7 @@ module.exports = function autoFishing(mod) {
                     case 'bank': {
                         action = 'bank';
                         if (scrollsInCooldown) {
-                            mod.setTimeout(makeDecision, 60 * 1000);
+                            scheduleNext(makeDecision, 60 * 1000);
                             action = 'wait';
                         } else if (pcbangBanker == null) {
                             let scroll = mod.game.inventory.findInBagOrPockets(ITEMS_BANKER);
@@ -884,11 +949,7 @@ module.exports = function autoFishing(mod) {
                 request = { bait: bait };
                 break;
             case 'craft': {
-                if (config.recipe === undefined) {
-                    if (!warnedMissingCraftRecipe) {
-                        notify('No bait recipe selected. Select one with /8 fish setrecipe bait3 (or bait2/bait4/bait5). Continuing without crafting for now.');
-                        warnedMissingCraftRecipe = true;
-                    }
+                if (!selectedRecipe) {
                     action = 'userod';
                     request = { rod: mod.game.inventory.findInBagOrPockets(flatSingle(ITEMS_RODS)) };
                     if (request.rod === undefined) {
@@ -896,7 +957,7 @@ module.exports = function autoFishing(mod) {
                         action = 'aborted';
                     }
                 } else {
-                    request = { recipe: config.recipe };
+                    request = { recipe: selectedRecipe.id };
                 }
                 break;
             }
@@ -1040,79 +1101,104 @@ module.exports = function autoFishing(mod) {
             mod.setTimeout(makeDecision, rng(config.time.decision));
             return;
         }
+        // [Phase 2] snapshot filets so we can learn this recipe's cost on success
+        craftFiletsBefore = itemAmount(mod.game.inventory.findInBagOrPockets(FILET_ID));
+        craftingRecipeId = request.recipe;
         mod.send('C_START_PRODUCE', 1, { recipe: request.recipe });
+        // [Phase 1] recover if the server never answers
+        mod.clearTimeout(craftSafetyTimer);
+        craftSafetyTimer = mod.setTimeout(() => { notify('Craft timed out (no result) - resuming.'); makeDecision(); }, 8000);
     }
 
     function shouldContinueCraftingBait() {
-        const selectedRecipe = getSelectedRecipe();
-        if (!selectedRecipe || !config.autocraftbait)
-            return false;
-
-        const filets = mod.game.inventory.findInBagOrPockets(FILET_ID);
-        if (filets === undefined || filets.amount < config.craftBaitMinFilets)
-            return false;
-
-        const selectedBait = mod.game.inventory.findInBagOrPockets(selectedRecipe.item);
-        return itemAmount(selectedBait) <= BAIT_STACK_LIMIT - BAIT_CRAFT_AMOUNT;
+        if (!config.autocraftbait) return false;
+        const filetAmt = itemAmount(mod.game.inventory.findInBagOrPockets(FILET_ID));
+        const r = getSelectedRecipe();
+        if (!r || filetAmt < recipeCost(r.id)) return false;    // [Phase 2] per-recipe cost
+        const baitAmt = itemAmount(mod.game.inventory.findInBagOrPockets(r.item));
+        return baitAmt + BAIT_CRAFT_AMOUNT <= craftTarget();    // [Phase 3] up to target
     }
 
     // ---------------------------------------------------------------------------------
     //  [C] Break scheduling  /  [E] auto-stop
     // ---------------------------------------------------------------------------------
+    // Single interval drives breaks + auto-stop off absolute deadlines. setInterval is NOT
+    // touched by mod.clearAllTimeouts(), and the deadlines are plain numbers, so neither
+    // can be wiped by the fishing chain's clearAllTimeouts (the old setTimeout-based
+    // version silently died after a break or zone load).
+    function startScheduler() {
+        stopScheduler();
+        schedulerTimer = mod.setInterval(schedulerTick, 5000);
+    }
+    function stopScheduler() {
+        if (schedulerTimer) { mod.clearInterval(schedulerTimer); schedulerTimer = null; }
+    }
+    function schedulerTick() {
+        if (!enabled || !config) return;
+        const now = Date.now();
+        if (onBreak) {
+            if (breakEndAt && now >= breakEndAt) endBreak();
+            return; // never auto-stop mid-break
+        }
+        if (breakNextAt && now >= breakNextAt) { startBreak(); return; }
+        if (autostopAt && now >= autostopAt) {
+            notify('Auto-stop: time limit reached.');
+            if (enabled) toggleHooks();
+            return;
+        }
+        if (config.autostop && config.autostop.dailyTime) {
+            const d = new Date();
+            const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+            if (hhmm === config.autostop.dailyTime) {
+                notify(`Auto-stop: daily time ${config.autostop.dailyTime} reached.`);
+                if (enabled) toggleHooks();
+            }
+        }
+    }
+
     function scheduleBreak() {
-        clearBreakTimers();
-        if (!config.breaks || !config.breaks.enabled) return;
-        let mins = rng(config.breaks.fishMin, config.breaks.fishMax);
-        breakTimer = mod.setTimeout(startBreak, mins * 60000);
-        if (DEBUG) mod.command.message(`Next break in ~${mins} min.`);
+        if (config.breaks && config.breaks.enabled) {
+            const mins = rng(config.breaks.fishMin, config.breaks.fishMax);
+            breakNextAt = Date.now() + mins * 60000;
+            breakEndAt = 0;
+            if (DEBUG) mod.command.message(`Next break in ~${mins} min.`);
+        } else {
+            breakNextAt = 0;
+        }
     }
 
     function startBreak() {
         if (!enabled) return;
         onBreak = true;
-        mod.clearAllTimeouts(); // stop the active fishing chain
-        let mins = rng(config.breaks.idleMin, config.breaks.idleMax);
+        mod.clearAllTimeouts(); // stop the active fishing chain (deadlines/interval survive)
+        const mins = rng(config.breaks.idleMin, config.breaks.idleMax);
+        breakEndAt = Date.now() + mins * 60000;
         notify(`Taking a break for ~${mins} min.`);
-        breakTimer = mod.setTimeout(endBreak, mins * 60000); // set AFTER clearAllTimeouts
     }
 
     function endBreak() {
         if (!enabled) return;
         onBreak = false;
+        breakEndAt = 0;
         notify('Break over - resuming fishing.');
         scheduleBreak();
         makeDecision();
     }
 
     function clearBreakTimers() {
-        if (breakTimer) { mod.clearTimeout(breakTimer); breakTimer = null; }
         onBreak = false;
+        breakNextAt = 0;
+        breakEndAt = 0;
     }
 
     function scheduleAutostop() {
-        clearAutostop();
-        if (!config.autostop) return;
-        if (config.autostop.afterMinutes > 0) {
-            autostopTimer = mod.setTimeout(() => {
-                notify('Auto-stop: time limit reached.');
-                if (enabled) toggleHooks();
-            }, config.autostop.afterMinutes * 60000);
-        }
-        if (config.autostop.dailyTime) {
-            clockTimer = mod.setInterval(() => {
-                let now = new Date();
-                let hhmm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-                if (hhmm === config.autostop.dailyTime) {
-                    notify(`Auto-stop: daily time ${config.autostop.dailyTime} reached.`);
-                    if (enabled) toggleHooks();
-                }
-            }, 60000);
-        }
+        autostopAt = (config.autostop && config.autostop.afterMinutes > 0)
+            ? Date.now() + config.autostop.afterMinutes * 60000
+            : 0;
     }
 
     function clearAutostop() {
-        if (autostopTimer) { mod.clearTimeout(autostopTimer); autostopTimer = null; }
-        if (clockTimer) { mod.clearInterval(clockTimer); clockTimer = null; }
+        autostopAt = 0;
     }
 
     // ---------------------------------------------------------------------------------
@@ -1159,10 +1245,17 @@ module.exports = function autoFishing(mod) {
             appendLog(msg);
     }
 
-    function appendLog(msg) {
+    // [#8] Append a line to a log file, truncating first if it has grown past 5 MB.
+    function writeLog(file, line) {
         try {
-            fs.appendFileSync(path.join(__dirname, 'auto-fishing.log'), `[${new Date().toISOString()}] ${msg}\n`);
+            const p = path.join(__dirname, file);
+            try { if (fs.statSync(p).size > 5 * 1024 * 1024) fs.writeFileSync(p, ''); } catch (_) {}
+            fs.appendFileSync(p, line);
         } catch (_) { /* mod folder may be read-only when toolbox isn't elevated */ }
+    }
+
+    function appendLog(msg) {
+        writeLog('auto-fishing.log', `[${new Date().toISOString()}] ${msg}\n`);
     }
 
     // Verbose packet trace, only when DEBUG is on. Writes to console AND
@@ -1171,9 +1264,7 @@ module.exports = function autoFishing(mod) {
         if (!DEBUG) return;
         let line = `${tag}${obj ? ' ' + JSON.stringify(obj) : ''}`;
         console.log(`auto-fishing| ${line}`);
-        try {
-            fs.appendFileSync(path.join(__dirname, 'auto-fishing-debug.log'), `[${new Date().toISOString()}] ${line}\n`);
-        } catch (_) { /* read-only fallback */ }
+        writeLog('auto-fishing-debug.log', `[${new Date().toISOString()}] ${line}\n`);
     }
 
     function getItemIdChatLink(chatLink) {
@@ -1307,7 +1398,10 @@ module.exports = function autoFishing(mod) {
         if (c.autocraftbait === undefined) c.autocraftbait = true;
         if (!(c.craftBaitThreshold >= 0)) c.craftBaitThreshold = 0; // craft when bait stack is at/below this amount
         c.craftBaitThreshold = Math.min(c.craftBaitThreshold, BAIT_STACK_LIMIT - BAIT_CRAFT_AMOUNT);
-        if (!(c.craftBaitMinFilets >= 60)) c.craftBaitMinFilets = 60; // recipe consumes 60 filets on current servers
+        if (!(c.craftBaitMinFilets >= 1)) c.craftBaitMinFilets = 30; // fallback only for unknown recipes (known costs: 15/20/25/30)
+        if (c.recipeCosts === undefined || typeof c.recipeCosts !== 'object') c.recipeCosts = {}; // learned filets/craft per recipe id
+        if (!(c.craftBaitTarget >= BAIT_CRAFT_AMOUNT)) c.craftBaitTarget = BAIT_STACK_LIMIT; // fill bait up to this (<=stack 60)
+        c.craftBaitTarget = Math.min(c.craftBaitTarget, BAIT_STACK_LIMIT);
         if (c.skipbaf === undefined) c.skipbaf = false;
         // new options
         if (c.humanize === undefined) c.humanize = true;
@@ -1342,8 +1436,7 @@ module.exports = function autoFishing(mod) {
         mod.command.message(`reel (LOCKED): ${REEL_BASE.min / 1000}-${REEL_BASE.max / 1000}s + tier x ${REEL_PER_LEVEL.min / 1000}-${REEL_PER_LEVEL.max / 1000}s, cap ${REEL_CAP / 1000}s | speed: ${config.speed} (biases within range)`);
         mod.command.message(`timings(ms): react ${T.stMinigame.min}-${T.stMinigame.max}, recast ${T.rod.min}-${T.rod.max}, decision ${T.decision.min}-${T.decision.max}`);
         mod.command.message(`filetmode: ${config.filetmode || 'off'} | skipbaf: ${config.skipbaf ? 'on' : 'off'} | autosalad: ${config.autosalad ? 'on' : 'off'}`);
-        mod.command.message(`autocraft bait: ${config.autocraftbait ? 'on' : 'off'} | recipe: ${formatRecipe()} | threshold: <=${config.craftBaitThreshold} bait | min filets: ${config.craftBaitMinFilets}`);
-        mod.command.message(`craft fill: target ${BAIT_STACK_LIMIT}, next craft allowed at <=${BAIT_STACK_LIMIT - BAIT_CRAFT_AMOUNT}`);
+        mod.command.message(`autocraft: ${config.autocraftbait ? 'on' : 'off'} | recipe: ${formatRecipe()} | threshold <=${config.craftBaitThreshold} | target ${craftTarget()}`);
         mod.command.message('Tune fast: /8 fish speed slow|normal|fast  -  or edit config.json then /8 fish reloadconf');
     }
 
@@ -1392,6 +1485,33 @@ module.exports = function autoFishing(mod) {
             return null;
 
         return Object.values(BAIT_RECIPES).find(entry => entry.id === config.recipe) || null;
+    }
+
+    // [Phase 2] Filets a craft consumes for a recipe: known cost > learned (unknown servers) > fallback.
+    function recipeCost(id) {
+        const entry = Object.values(BAIT_RECIPES).find(r => r.id === id);
+        if (entry && entry.cost > 0) return entry.cost;
+        const learned = config.recipeCosts && config.recipeCosts[id];
+        return (learned > 0) ? learned : (config.craftBaitMinFilets || 30);
+    }
+
+    // [Phase 3] Fill bait up to this amount (clamped to the 60 stack).
+    function craftTarget() {
+        return Math.max(BAIT_CRAFT_AMOUNT, Math.min(config.craftBaitTarget || BAIT_STACK_LIMIT, BAIT_STACK_LIMIT));
+    }
+
+    // [Phase 2] For UNKNOWN recipes only (no hardcoded cost), measure filets consumed and remember it.
+    function learnRecipeCost() {
+        if (craftingRecipeId == null || craftFiletsBefore == null) return;
+        const known = Object.values(BAIT_RECIPES).find(r => r.id === craftingRecipeId);
+        if (known && known.cost > 0) { craftFiletsBefore = null; return; } // trust the exact cost
+        const nowAmt = itemAmount(mod.game.inventory.findInBagOrPockets(FILET_ID));
+        const cost = craftFiletsBefore - nowAmt;
+        if (cost > 0 && cost < 100000) {
+            config.recipeCosts[craftingRecipeId] = cost;
+            if (DEBUG) mod.command.message(`Learned recipe ${craftingRecipeId} cost: ${cost} filets/craft.`);
+        }
+        craftFiletsBefore = null;
     }
 
     function fmtDur(ms) {
@@ -1461,19 +1581,21 @@ module.exports = function autoFishing(mod) {
                 if (recipeArg === 'clear') {
                     delete config.recipe;
                     warnedMissingCraftRecipe = false;
-                    mod.command.message('Crafting recipe cleared.');
+                    mod.saveSettings(); // persist immediately so it's remembered across sessions
+                    mod.command.message('Crafting recipe cleared and saved.');
                 } else if (recipeArg && BAIT_RECIPES[recipeArg]) {
                     const recipe = BAIT_RECIPES[recipeArg];
                     config.recipe = recipe.id;
                     warnedMissingCraftRecipe = false;
-                    mod.command.message(`Crafting recipe set to ${recipe.label} (${recipe.id}).`);
+                    mod.saveSettings();
+                    mod.command.message(`Crafting recipe set to ${recipe.label} (${recipe.id}) and saved - I'll remember it until you change it.`);
                 } else if (lastRecipe != null) {
                     config.recipe = lastRecipe;
                     warnedMissingCraftRecipe = false;
-                    mod.command.message(`Recipe id set to: ${lastRecipe}`);
+                    mod.saveSettings();
+                    mod.command.message(`Recipe set to last crafted (${lastRecipe}) and saved.`);
                 } else {
-                    mod.command.message('No recipe selected. Use /8 fish setrecipe bait3, or manually craft bait once then /8 fish setrecipe.');
-                    mod.command.message('Available presets: bait2, bait3, bait4, bait5.');
+                    mod.command.message('No recipe selected. Use /8 fish setrecipe bait2|bait3|bait4|bait5 (pick one you have learned), or craft one manually then /8 fish setrecipe.');
                 }
                 break;
             case 'autocraft': {
@@ -1490,35 +1612,32 @@ module.exports = function autoFishing(mod) {
                     } else mod.command.message('Usage: /8 fish autocraft threshold <amount>');
                 } else if (arg === 'minfilets') {
                     const n = parseInt(arg2);
-                    if (n >= 60) {
+                    if (n >= 1) {
                         config.craftBaitMinFilets = n;
-                        mod.command.message(`Auto-craft bait minimum filets set to ${config.craftBaitMinFilets}.`);
-                    } else mod.command.message('Usage: /8 fish autocraft minfilets <amount>=60 or higher');
+                        mod.command.message(`Fallback filet cost set to ${config.craftBaitMinFilets} (only used for unknown recipes; known baits use 15/20/25/30).`);
+                    } else mod.command.message('Usage: /8 fish autocraft minfilets <amount>');
+                } else if (arg === 'target') {
+                    const n = parseInt(arg2);
+                    if (n >= BAIT_CRAFT_AMOUNT) {
+                        config.craftBaitTarget = Math.min(n, BAIT_STACK_LIMIT);
+                        mod.command.message(`Auto-craft will fill bait up to ${config.craftBaitTarget} (max ${BAIT_STACK_LIMIT}).`);
+                    } else mod.command.message(`Usage: /8 fish autocraft target <${BAIT_CRAFT_AMOUNT}-${BAIT_STACK_LIMIT}>`);
                 } else {
-                    mod.command.message(`Auto-craft bait is ${config.autocraftbait ? 'ON' : 'off'} | recipe: ${formatRecipe()} | threshold <=${config.craftBaitThreshold} | min filets ${config.craftBaitMinFilets}`);
-                    mod.command.message(`Craft fill target: ${BAIT_STACK_LIMIT}; next craft allowed at <=${BAIT_STACK_LIMIT - BAIT_CRAFT_AMOUNT}.`);
-                    mod.command.message('Usage: /8 fish autocraft on|off | autocraft threshold <amount> | autocraft minfilets <amount>');
+                    const costs = Object.keys(BAIT_RECIPES).map(k => { const r = BAIT_RECIPES[k]; return `${r.label}:${recipeCost(r.id)}f`; }).join(' ');
+                    mod.command.message(`Auto-craft is ${config.autocraftbait ? 'ON' : 'off'} | recipe: ${formatRecipe()} | threshold <=${config.craftBaitThreshold} | target ${craftTarget()}`);
+                    mod.command.message(`Filets per craft (makes ${BAIT_CRAFT_AMOUNT}): ${costs}`);
+                    mod.command.message('Usage: autocraft on|off | threshold <n> | target <n> | minfilets <n>');
                 }
+                mod.saveSettings(); // persist crafting setup immediately
                 break;
             }
             case 'sellscroll':
-                config.filetmode = 'sellscroll';
-                mod.command.message('Set to sell fishes (scroll) after filling inventory.');
-                if (Object.values(extendedFunctions.seller).some(x => !x)) {
-                    config.filetmode = false;
-                    mod.command.message('Seller packets not mapped, sellscroll functions disabled.');
-                }
+            case 'selltonpc':
+                // [#4] Selling on full inventory was removed - the bot now stops & notifies when
+                // the bag fills with kept fish. These modes no longer do anything.
+                if (config.filetmode === 'sellscroll' || config.filetmode === 'selltonpc') config.filetmode = false;
+                mod.command.message('Auto-selling is not available in this version. When the bag fills with kept fish, the bot stops and notifies you. Use the dismantle table to control what is kept vs dismantled.');
                 break;
-            case 'selltonpc': {
-                config.filetmode = 'selltonpc';
-                mod.command.message('Sell to NPC enabled.');
-                let dist = parseInt(arg);
-                if (dist > 0) { config.contdist = (dist > 8) ? 6 : dist; mod.command.message(`NPC contact range: ${config.contdist}m`); }
-                let npc = findClosestNpc();
-                if (npc === undefined || npc.distance === undefined || npc.distance > config.contdist * 25)
-                    mod.command.message('Warning: no seller NPC within range.');
-                break;
-            }
             case 'autosalad':
                 config.autosalad = !config.autosalad;
                 mod.command.message('Auto fish salad ' + (config.autosalad ? 'enabled' : 'disabled') + '.');
@@ -1611,9 +1730,9 @@ module.exports = function autoFishing(mod) {
                 break;
             case 'sniff':
                 if (!DEBUG) { DEBUG = true; mod.command.message('(debug auto-enabled for sniffing)'); }
-                sniffFishing = true;
+                startSniff();
                 mod.clearTimeout(sniffTimer);
-                sniffTimer = mod.setTimeout(() => { sniffFishing = false; mod.command.message('Sniffing stopped.'); }, 120000);
+                sniffTimer = mod.setTimeout(() => { stopSniff(); mod.command.message('Sniffing stopped.'); }, 120000);
                 mod.command.message('Sniffing outgoing packets for 2 min - do ONE full MANUAL fishing cycle now (cast, wait for bite, press F to reel, catch).');
                 break;
             case 'info':
@@ -1642,7 +1761,7 @@ module.exports = function autoFishing(mod) {
                 mod.command.message('  skipbaf | autosalad | humanize | notify | logfile');
                 mod.command.message('  dismantle on|off | now | tier <0-10> on|off | baf on|off | allon|alloff | status | <ctrl+click fish>');
                 mod.command.message('  filetmode bank <n> | setrecipe bait2|bait3|bait4|bait5 | setrecipe clear');
-                mod.command.message('  autocraft on|off | autocraft threshold <n> | autocraft minfilets <n>');
+                mod.command.message('  autocraft on|off | threshold <n> | target <n> | minfilets <n>');
                 mod.command.message('  breaks on|off | breaks set <fishMin> <fishMax> <idleMin> | autostop <min> | autostop daily <HH:MM>');
                 mod.command.message('  gmmode exit|lobby|stop|nothing | save | reloadconf');
                 mod.command.message('  Troubleshooting: /8 fish debug logs packets to mods/auto-fishing/auto-fishing-debug.log');
@@ -1652,11 +1771,6 @@ module.exports = function autoFishing(mod) {
                     mod.command.message('Unknown command. Try /8 fish help');
                 } else {
                     if (!config) { mod.command.message('Not in game yet.'); break; }
-                    if (config.filetmode == 'selltonpc') {
-                        let npc = findClosestNpc();
-                        if (npc === undefined || npc.distance === undefined || npc.distance > config.contdist * 25)
-                            mod.command.message('Warning: no seller NPC within range.');
-                    }
                     toggleHooks();
                 }
                 break;

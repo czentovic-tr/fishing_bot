@@ -3,7 +3,7 @@
     "author": "czentovic-tr and BunnyS (original by SoliaRdi)",
     "maintainer": "czentovic-tr",
     "description": "Automated fishing for TERA (Asura). Maintained by czentovic-tr (https://github.com/czentovic-tr); original mod by SoliaRdi. Table-driven instant dismantle, auto-craft bait recipe presets, humanized tier-scaled anti-detection timing, break scheduling, auto-stop and stats.",
-    "version": "3.6.0-asura",
+    "version": "3.6.1-asura",
     "keywords": ["network"],
     "disableAutoUpdate": false,
     "servers": ["https://raw.githubusercontent.com/czentovic-tr/fishing_bot/main/"],

@@ -154,6 +154,7 @@ module.exports = function autoFishing(mod) {
     let craftingRecipeId = null;                   // [craft] recipe id of the in-flight craft
     let craftFailures = 0;                          // [craft] consecutive failed crafts
     let craftSafetyTimer = null;                    // [craft] recover if S_END_PRODUCE never arrives
+    let crafting = false;                            // [craft] a C_START_PRODUCE is in flight (prevents overlap/stacking)
 
     let extendedFunctions = {
         'banker': { 'C_PUT_WARE_ITEM': false },
@@ -310,8 +311,8 @@ module.exports = function autoFishing(mod) {
             mod.command.message('Auto fishing activated. Manually start fishing now.');
             if (mod.majorPatchVersion >= 88)
                 mod.command.message('Auto-calibrating the fishing counter - just cast and let it run.');
-            // reset in-flight calibration state for a clean session
-            awaitingStart = false; calTries = 0;
+            // reset in-flight calibration/craft state for a clean session
+            awaitingStart = false; calTries = 0; crafting = false;
 
             hook('S_FISHING_BITE', 1, sFishingBite);
             hook('S_START_FISHING_MINIGAME', 1, sStartFishingMinigame);
@@ -604,6 +605,7 @@ module.exports = function autoFishing(mod) {
     function sEndProduce(event) {
         if (request.action !== 'craft') return;
         mod.clearTimeout(craftSafetyTimer);
+        crafting = false;
         if (event.success) {
             craftFailures = 0;
             stats.baitsCrafted += BAIT_CRAFT_AMOUNT;
@@ -881,7 +883,7 @@ module.exports = function autoFishing(mod) {
 
         const activeBait = Object.keys(BAITS).some(el => abnormalityDuration(Number(el)) > 0);
         const craftWouldFit = selectedRecipe && (selectedBaitAmount + BAIT_CRAFT_AMOUNT <= craftTarget()); // [Phase 3] up to target
-        const canCraftBait = config.autocraftbait && selectedRecipe && filetAmt >= craftCost && craftWouldFit; // [Phase 2] per-recipe cost
+        const canCraftBait = config.autocraftbait && !crafting && selectedRecipe && filetAmt >= craftCost && craftWouldFit; // [Phase 2] per-recipe cost; !crafting = no overlap
         const shouldCraftBait = canCraftBait && selectedBaitAmount <= config.craftBaitThreshold;
 
         // one-time hint if auto-craft is on but there's no usable recipe
@@ -1098,16 +1100,32 @@ module.exports = function autoFishing(mod) {
 
     function startCraft() {
         if (request.recipe === undefined || request.recipe === null) {
-            mod.setTimeout(makeDecision, rng(config.time.decision));
+            scheduleNext(makeDecision, rng(config.time.decision));
             return;
         }
         // [Phase 2] snapshot filets so we can learn this recipe's cost on success
+        crafting = true;
         craftFiletsBefore = itemAmount(mod.game.inventory.findInBagOrPockets(FILET_ID));
         craftingRecipeId = request.recipe;
         mod.send('C_START_PRODUCE', 1, { recipe: request.recipe });
-        // [Phase 1] recover if the server never answers
+        // Recover if S_END_PRODUCE is slow/missing. Generous window (production + lag can
+        // exceed a few seconds); on timeout we go back to FISHING, not re-craft, to avoid a
+        // craft-timeout loop / stall. A late S_END is then ignored (request.action != craft).
         mod.clearTimeout(craftSafetyTimer);
-        craftSafetyTimer = mod.setTimeout(() => { notify('Craft timed out (no result) - resuming.'); makeDecision(); }, 8000);
+        craftSafetyTimer = mod.setTimeout(() => {
+            crafting = false;
+            notify('Craft timed out (no result) - resuming fishing.');
+            resumeFishing();
+        }, 15000);
+    }
+
+    // Force a rod cast to resume the loop (used by the craft-timeout recovery so it never
+    // bounces straight back into another craft).
+    function resumeFishing() {
+        const rod = mod.game.inventory.findInBagOrPockets(flatSingle(ITEMS_RODS));
+        if (rod === undefined) { notify('No fishing rod found - stopping.'); if (enabled) toggleHooks(); return; }
+        request = { action: 'userod', rod: rod };
+        processDecision();
     }
 
     function shouldContinueCraftingBait() {
